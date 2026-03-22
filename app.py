@@ -1,5 +1,9 @@
-import streamlit as st
+import io
+
 import pandas as pd
+import streamlit as st
+from PIL import Image
+
 from modules.parser import parse_uploaded_file
 from modules.costing import (
     DEFAULT_LOCATION_FACTORS,
@@ -9,6 +13,19 @@ from modules.costing import (
 )
 from modules.report import generate_csv_bytes, generate_text_report
 
+# Optional OCR imports
+OCR_AVAILABLE = True
+OCR_IMPORT_ERROR = ""
+
+try:
+    import cv2
+    import numpy as np
+    import pytesseract
+except Exception as e:
+    OCR_AVAILABLE = False
+    OCR_IMPORT_ERROR = str(e)
+
+
 st.set_page_config(page_title="Pinoy Renovation Estimator", layout="wide")
 
 st.title("🇵🇭 Pinoy Renovation Estimator")
@@ -16,26 +33,68 @@ st.caption(
     "Upload a floor plan image or PDF, review extracted scope items, then generate a Philippine-style renovation cost estimate."
 )
 
-with st.sidebar:
-    st.header("Project Settings")
-    location = st.selectbox(
-        "Project Location",
-        list(DEFAULT_LOCATION_FACTORS.keys()),
-        index=0,
-        help="Location factor adjusts unit costs to reflect typical differences across PH locations.",
-    )
-    finish_level = st.selectbox(
-        "Finish Level",
-        list(DEFAULT_FINISH_FACTORS.keys()),
-        index=1,
-        help="Budget / Midrange / Premium multiplier for materials and fixtures.",
-    )
-    contingency_pct = st.slider("Contingency (%)", 0.0, 20.0, 5.0, 0.5)
-    overhead_pct = st.slider("OHP / Contractor Markup (%)", 0.0, 30.0, 10.0, 0.5)
-    vat_pct = st.slider("VAT (%)", 0.0, 12.0, 12.0, 0.5)
 
-tab1, tab2, tab3 = st.tabs(["1) Upload & Extract", "2) Review Scope", "3) Estimate Output"])
+# =========================================================
+# OCR HELPERS
+# =========================================================
+def extract_text_from_image_ocr(file_bytes: bytes) -> tuple[str, list[str]]:
+    """
+    Lightweight OCR pipeline for image uploads.
+    Requires: opencv-python, numpy, pytesseract, and Tesseract installed on system.
+    """
+    notes = []
 
+    if not OCR_AVAILABLE:
+        notes.append(
+            "OCR libraries are not available. Install opencv-python, numpy, pytesseract, "
+            "and ensure Tesseract OCR is installed on the machine."
+        )
+        if OCR_IMPORT_ERROR:
+            notes.append(f"OCR import error: {OCR_IMPORT_ERROR}")
+        return "", notes
+
+    try:
+        file_arr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(file_arr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            notes.append("Could not decode the uploaded image for OCR.")
+            return "", notes
+
+        # Basic preprocessing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
+
+        # OCR config tuned for general block text
+        config = r"--oem 3 --psm 6"
+        text = pytesseract.image_to_string(thresh, config=config)
+
+        if text.strip():
+            notes.append("OCR text extracted from image successfully.")
+        else:
+            notes.append(
+                "OCR ran but returned little or no text. Photo may be blurry, rotated, dim, or handwritten too roughly."
+            )
+
+        return text, notes
+
+    except Exception as e:
+        notes.append(f"OCR failed: {e}")
+        return "", notes
+
+
+def preview_uploaded_image(uploaded_file):
+    try:
+        img = Image.open(uploaded_file)
+        st.image(img, caption="Uploaded Image Preview", use_container_width=True)
+    except Exception:
+        st.warning("Could not preview the uploaded image.")
+
+
+# =========================================================
+# SESSION STATE
+# =========================================================
 if "extracted_df" not in st.session_state:
     st.session_state.extracted_df = pd.DataFrame(
         columns=[
@@ -54,11 +113,57 @@ if "raw_text" not in st.session_state:
 if "last_parse_notes" not in st.session_state:
     st.session_state.last_parse_notes = []
 
+if "ocr_text" not in st.session_state:
+    st.session_state.ocr_text = ""
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+with st.sidebar:
+    st.header("Project Settings")
+    location = st.selectbox(
+        "Project Location",
+        list(DEFAULT_LOCATION_FACTORS.keys()),
+        index=0,
+        help="Location factor adjusts unit costs to reflect typical differences across PH locations.",
+    )
+    finish_level = st.selectbox(
+        "Finish Level",
+        list(DEFAULT_FINISH_FACTORS.keys()),
+        index=1,
+        help="Budget / Midrange / Premium multiplier for materials and fixtures.",
+    )
+    contingency_pct = st.slider("Contingency (%)", 0.0, 20.0, 5.0, 0.5)
+    overhead_pct = st.slider("OHP / Contractor Markup (%)", 0.0, 30.0, 10.0, 0.5)
+    vat_pct = st.slider("VAT (%)", 0.0, 12.0, 12.0, 0.5)
+
+    st.divider()
+    st.subheader("OCR Status")
+    if OCR_AVAILABLE:
+        st.success("Image OCR libraries detected.")
+    else:
+        st.warning("Image OCR libraries not installed yet.")
+        st.caption("Install: opencv-python, numpy, pytesseract")
+        st.caption("Also install the Tesseract engine on your machine.")
+
+
+# =========================================================
+# TABS
+# =========================================================
+tab1, tab2, tab3 = st.tabs(["1) Upload & Extract", "2) Review Scope", "3) Estimate Output"])
+
 with tab1:
     uploaded = st.file_uploader(
         "Upload floor plan or sketch",
         type=["pdf", "png", "jpg", "jpeg"],
-        help="CAD PDF is best. Hand-drawn sketches also work, but extracted items should still be reviewed.",
+        help="CAD PDF is best. Hand-drawn sketches also work, especially with OCR + manual notes.",
+    )
+
+    use_image_ocr = st.checkbox(
+        "Use OCR for image uploads",
+        value=True,
+        help="For JPG/PNG uploads, the app will try to read printed or handwritten notes from the image.",
     )
 
     c1, c2 = st.columns([1, 1])
@@ -67,13 +172,14 @@ with tab1:
             "Optional manual/typed scope notes",
             placeholder=(
                 "Example:\n"
-                "Living room repaint all walls\n"
+                "Living room repaint all walls 45 sqm\n"
                 "Kitchen install gypsum ceiling 12 sqm\n"
                 "Replace 2 doors in bedrooms\n"
                 "Tile replacement toilet 6 sqm"
             ),
             height=180,
         )
+
     with c2:
         st.markdown("**Supported starter scopes**")
         st.markdown(
@@ -88,29 +194,103 @@ with tab1:
 """
         )
 
+    if uploaded is not None:
+        file_name = uploaded.name.lower()
+        if file_name.endswith((".png", ".jpg", ".jpeg")):
+            preview_uploaded_image(uploaded)
+            uploaded.seek(0)
+
     if st.button("Extract Scope Items", type="primary", use_container_width=True):
         if uploaded is None and not manual_scope.strip():
             st.warning("Please upload a file or provide manual scope notes.")
         else:
-            parsed = parse_uploaded_file(uploaded, manual_scope)
-            st.session_state.extracted_df = parsed["items_df"]
-            st.session_state.raw_text = parsed["raw_text"]
-            st.session_state.last_parse_notes = parsed["notes"]
+            parse_notes = []
+            final_raw_text = ""
+            parsed = None
+
+            if uploaded is not None:
+                file_name = uploaded.name.lower()
+
+                # =========================================================
+                # IMAGE FLOW WITH OCR
+                # =========================================================
+                if file_name.endswith((".png", ".jpg", ".jpeg")):
+                    uploaded_bytes = uploaded.read()
+
+                    ocr_text = ""
+                    if use_image_ocr:
+                        ocr_text, ocr_notes = extract_text_from_image_ocr(uploaded_bytes)
+                        parse_notes.extend(ocr_notes)
+
+                    st.session_state.ocr_text = ocr_text
+
+                    combined_text_parts = []
+                    if ocr_text.strip():
+                        combined_text_parts.append(ocr_text)
+                    if manual_scope.strip():
+                        combined_text_parts.append(manual_scope)
+
+                    combined_text = "\n".join(combined_text_parts).strip()
+
+                    if not combined_text:
+                        parse_notes.append(
+                            "No OCR text or manual notes were available. Please type some scope notes manually."
+                        )
+                        st.session_state.extracted_df = pd.DataFrame(
+                            columns=[
+                                "scope_code",
+                                "scope_name",
+                                "location_tag",
+                                "quantity",
+                                "unit",
+                                "remarks",
+                            ]
+                        )
+                        st.session_state.raw_text = ""
+                        st.session_state.last_parse_notes = parse_notes
+                    else:
+                        # Feed combined OCR text + manual notes to existing parser logic
+                        parsed = parse_uploaded_file(None, combined_text)
+
+                # =========================================================
+                # PDF FLOW
+                # =========================================================
+                elif file_name.endswith(".pdf"):
+                    uploaded.seek(0)
+                    parsed = parse_uploaded_file(uploaded, manual_scope)
+
+                else:
+                    parse_notes.append("Unsupported file type.")
+
+            else:
+                # Manual text only
+                parsed = parse_uploaded_file(None, manual_scope)
+
+            if parsed is not None:
+                merged_notes = parse_notes + parsed.get("notes", [])
+                st.session_state.extracted_df = parsed["items_df"]
+                st.session_state.raw_text = parsed["raw_text"]
+                st.session_state.last_parse_notes = merged_notes
+
+    if st.session_state.ocr_text:
+        st.subheader("OCR Text from Image")
+        st.code(st.session_state.ocr_text[:10000], language="text")
 
     if st.session_state.raw_text:
         st.subheader("Extracted / Combined Raw Text")
-        st.code(st.session_state.raw_text[:10000] if st.session_state.raw_text else "", language="text")
+        st.code(st.session_state.raw_text[:10000], language="text")
 
     if st.session_state.last_parse_notes:
-        st.subheader("Parser Notes")
+        st.subheader("Parser / OCR Notes")
         for note in st.session_state.last_parse_notes:
             st.info(note)
+
 
 with tab2:
     st.subheader("Editable Quantity Review")
     st.write(
         "Review and correct quantities before computing the estimate. "
-        "This is important especially for sketches and handwritten plans."
+        "This is important especially for sketches, photos, and handwritten plans."
     )
 
     if st.session_state.extracted_df.empty:
@@ -150,6 +330,7 @@ with tab2:
             with a5:
                 remarks = st.text_input("Remarks", key="quick_remarks", placeholder="white paint")
             add_now = st.form_submit_button("Add Item")
+
             if add_now:
                 code_map = {
                     "Painting works": "painting",
@@ -177,8 +358,10 @@ with tab2:
                 )
                 st.rerun()
 
+
 with tab3:
     st.subheader("Estimate")
+
     if st.session_state.extracted_df.empty:
         st.info("No scope items available yet.")
     else:
@@ -226,6 +409,7 @@ with tab3:
                 mime="text/plain",
                 use_container_width=True,
             )
+
 
 st.divider()
 st.caption(
